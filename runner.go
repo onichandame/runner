@@ -12,16 +12,6 @@ import (
 	goutils "github.com/onichandame/go-utils"
 )
 
-type status int
-
-const (
-	ready     status = iota
-	running   status = iota
-	completed status = iota
-	stopped   status = iota
-	failed    status = iota
-)
-
 type Runner struct {
 	Error error
 
@@ -31,7 +21,7 @@ type Runner struct {
 	cancel      func()
 	stdin       io.WriteCloser
 	log         *strings.Builder
-	clients     []chan string
+	clients     map[chan string]interface{}
 	clientslock sync.Mutex
 	done        chan int
 }
@@ -47,7 +37,7 @@ func NewRunner(cfg RunnerConfig) *Runner {
 	goutils.Assert(err)
 	r.stdin = stdin
 	r.log = new(strings.Builder)
-	r.clients = make([]chan string, 0)
+	r.clients = make(map[chan string]interface{})
 	r.status = ready
 	r.done = make(chan int)
 	return &r
@@ -105,17 +95,8 @@ func (r *Runner) Stop() {
 	}
 	r.status = stopped
 	r.cancel()
-	r.clientslock.Lock()
-	defer r.clientslock.Unlock()
-	for _, client := range r.clients {
-		close(client)
-	}
-	r.clients = make([]chan string, 0)
 }
 func (r *Runner) Wait() error {
-	if r.status < running {
-		panic(fmt.Errorf("cannot wait before runner starts"))
-	}
 	<-r.done
 	return r.Error
 }
@@ -124,27 +105,32 @@ func (r *Runner) WriteInput(inp string) {
 		panic(fmt.Errorf("cannot interact with a non-running runner"))
 	}
 	_, err := io.WriteString(r.stdin, inp)
+	r.log.WriteString(inp)
 	r.broadcast(inp)
 	goutils.Assert(err)
 }
 func (r *Runner) ReadOutput() <-chan string {
+	switch r.status {
+	case running, ready:
+	default:
+		panic(fmt.Errorf("cannot read output of a non-running runner"))
+	}
 	out := make(chan string)
 	if r.status != stopped {
 		r.clientslock.Lock()
 		defer r.clientslock.Unlock()
-		r.clients = append(r.clients, out)
+		r.clients[out] = nil
 	}
 	go func() {
-		log := r.log.String()
-		if log != "" {
-			out <- r.log.String()
-		}
-		if r.status == stopped {
-			close(out)
-		}
+		r.Wait()
+		r.clientslock.Lock()
+		defer r.clientslock.Unlock()
+		close(out)
+		delete(r.clients, out)
 	}()
 	return out
 }
+func (r *Runner) ReadLog() string { return r.log.String() }
 
 func (r *Runner) GetStatus() string {
 	switch r.status {
@@ -164,7 +150,10 @@ func (r *Runner) GetStatus() string {
 }
 
 func (r *Runner) broadcast(msg string) {
-	for _, client := range r.clients {
-		client <- msg
+	for client := range r.clients {
+		c := client
+		go func() {
+			c <- msg
+		}()
 	}
 }
